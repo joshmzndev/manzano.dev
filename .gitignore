@@ -1,0 +1,29 @@
+# Plaintext left behind if push_config.sh is interrupted before shredding
+*.zip
+gpg.asc
+
+# Keys and credentials
+*.asc
+*.gpg
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+known_hosts
+authorized_keys
+service_account*.json
+rclone.conf
+.git-credentials
+
+# Environment files
+.env
+.env.*
+
+# Other archives
+*.tar
+*.tar.gz
+*.tgz
+*.7z

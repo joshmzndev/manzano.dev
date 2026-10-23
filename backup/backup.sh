@@ -26,8 +26,8 @@ declare -A ENV_IN=(); for k in $(compgen -e); do ENV_IN[$k]=${!k}; done
 readonly BOT_EMAIL=noreply@tyas.tyc.edu.tw   # Drive account. Fixed on purpose: no override.
 
 # --- backup ---
-GOOGLE_SERVICE_ACCOUNT_FILE=~/.secret/service_account.json   # service account key (keep it chmod 600)
-RCLONE_CONFIG=~/.secret/rclone.conf   # written by setup; holds the encryption password + salt
+GOOGLE_SERVICE_ACCOUNT_FILE=~/.config/service_account.json   # service account key (keep it chmod 600)
+RCLONE_CONFIG=~/.config/rclone.conf   # written by setup; holds the encryption password + salt
 REMOTE_DIR=encrypted-backup        # folder in the bot's Drive (used by setup only)
 # Folders `backup` syncs, comma-separated. Each goes to current/NAME on Drive: NAME is the
 # folder's name, or PATH:NAME. While this is the default list, missing folders are skipped.
@@ -67,6 +67,11 @@ ARCHIVE_KEEP_DAYS=90
 # its own directory.json, updated on every run; only new or changed files are hashed, so the
 # first run reads everything once and can take a while for big folders. A directory.json
 # that organize didn't write is left alone (and not used).
+# Before anything moves, every .zip organize looks at (also loose ones in ORGANIZE_ROOT when
+# ORGANIZE_LOOSE=1, and zips inside zips) is unzipped next to itself and then deleted for good
+# (not trashed), so its files get organized like any others: photos.zip -> photos/, or,
+# when everything in it is in one folder, that folder (" (1)" when taken). Mac __MACOSX/
+# junk is dropped. A zip that can't be fully extracted (damaged, password-protected) stays.
 # Afterwards, empty folders in the organized folders are removed (checked empty first; a
 # folder holding only hidden files isn't empty). The top-level folder itself goes too if it
 # ends up empty, unless it's in ORGANIZE_KEEP_EMPTY or it's the PATH given to organize.
@@ -82,10 +87,9 @@ MUSIC_EXTS="mp3 flac wav ogg oga opus m4a aac wma aiff aif aifc ape wv dsf dff m
 PICTURES_EXTS="jpg jpeg jpe png gif bmp webp tif tiff heic heif avif jxl psd xcf kra
     dng cr2 cr3 crw nef nrw arw srf sr2 orf rw2 raf pef srw 3fr fff iiq x3f rwl mrw erf mef mos kdc dcr"
 VIDEOS_EXTS="mp4 m4v mkv mov avi wmv webm flv mpg mpeg 3gp 3g2 mts m2ts vob ogv divx rm rmvb asf mxf"
-# Left out on purpose, as they're as often part of a project or an app: txt md csv json xml
 # conf svg, key (Keynote, but also TLS keys), archives, disk images, installers, scripts.
 DOCUMENTS_EXTS="pdf doc docx odt rtf xls xlsx ods ppt pptx odp odg odf pages numbers djvu xps oxps
-    epub mobi azw3 ics vcf pub"
+    epub mobi azw3 ics vcf pub md csv yaml eml backup age gpg txt log json conf"
 
 # --- schedule + logs ---
 # `install` adds a systemd user timer that runs the backup BOOT_DELAY after boot and then
@@ -153,7 +157,8 @@ Usage: backup.sh COMMAND
   organize [PATH]    move music/pictures/videos/documents from the other folders in ~
                      (e.g. ~/Downloads), or only from PATH, into ~/Music, ~/Pictures,
                      ~/Videos, ~/Documents; with ORGANIZE_LOOSE=1 (and no PATH), every
-                     loose file in ~ too (Documents when no category fits).
+                     loose file in ~ too (Documents when no category fits). Zips are
+                     unzipped in place first, and then deleted.
   tidy               organize, and also sort out ~/Music, ~/Pictures, ~/Videos, ~/Documents
                      themselves: files of another category move to their folder, and
                      duplicates within a folder go to the Trash (one copy is kept)
@@ -283,7 +288,7 @@ need() {
     [[ -f $KEY ]] || die "No service account key at $KEY (set GOOGLE_SERVICE_ACCOUNT_FILE in $ENV_FILE)."
 }
 
-# chmod 600 the key and rclone.conf, and 700 their folders (e.g. ~/.secret). Folders that
+# chmod 600 the key and rclone.conf, and 700 their folders (e.g. ~/.config). Folders that
 # hold more than secrets (home, the script's own) are left as they are.
 make_private() {
     local f d
@@ -717,6 +722,70 @@ has_video() {
     return 1
 }
 
+# Unzips ZIP next to itself, then deletes it: into a folder named after it (photos.zip ->
+# photos/), or, when everything in it is in one folder, that folder. The zip stays when it
+# can't be fully extracted (damaged, password-protected: unzip gets an empty password rather
+# than asking). Uses organize's locals and counters.
+unzip_file() {
+    local z=$1 dir=${1%/*} tmp to
+    local -a entries=()
+    if [[ -n ${DRY_RUN:-} ]]; then
+        echo "  ${z#"$root"/} -> unzipped where it is, then deleted"
+        return 0
+    fi
+    tmp=$(mktemp -d "$dir/.unzip.XXXXXX") || { echo "  [FAIL] could not unzip $z" >&2; failed=$((failed + 1)); return 0; }
+    if ! unzip -qq -P '' -d "$tmp" "$z" </dev/null >/dev/null 2>&1; then
+        echo "  [WARN] could not unzip ${z#"$root"/} (damaged or password-protected?), leaving it" >&2
+        rm -rf -- "$tmp"
+        return 0
+    fi
+    rm -rf -- "$tmp/__MACOSX"
+    while IFS= read -r -d '' to; do entries+=("$to"); done \
+        < <(find "$tmp" -mindepth 1 -maxdepth 1 -print0)
+    if ((${#entries[@]} == 1)) && [[ -d ${entries[0]} && ! -L ${entries[0]} ]]; then
+        to=$(unique_path "$dir/${entries[0]##*/}")
+        mv -n -- "${entries[0]}" "$to" && rmdir -- "$tmp" || true
+    elif ((${#entries[@]} == 0)); then
+        to=; rmdir -- "$tmp" || true
+    else
+        to=$(unique_path "${z%.*}")
+        mv -n -- "$tmp" "$to" || true
+    fi
+    if [[ -e $tmp ]]; then
+        echo "  [FAIL] could not move what $z holds out of $tmp" >&2; failed=$((failed + 1)); return 0
+    fi
+    echo "  ${z#"$root"/} -> ${to:+unzipped into ${to#"$root"/}/, }zip deleted"
+    # Its files keep their dates from the zip: don't wait 10 minutes for recently zipped ones.
+    if [[ -n $to ]]; then
+        local pat=${to//\\/\\\\}; pat=${pat//\*/\\*}; pat=${pat//\?/\\?}; pat=${pat//\[/\\[}
+        fresh+=(-o -path "$pat/*")
+    fi
+    if rm -f -- "$z"; then
+        unzipped=$((unzipped + 1))
+    else
+        echo "  [FAIL] could not delete $z" >&2; failed=$((failed + 1))
+    fi
+}
+
+# Unzips every .zip under SRC that organize looks at (same PRUNE rules, not changed in the
+# last 10 minutes), zips found inside zips too; with --loose only the ones directly in SRC.
+# Uses organize's locals and counters.
+unzip_all() {
+    local depth=() z p found
+    [[ $1 == --loose ]] && { depth=(-maxdepth 1); shift; }
+    while :; do
+        found=0
+        while IFS= read -r -d '' z; do
+            [[ -z ${unzip_tried[$z]:-} ]] || continue
+            unzip_tried[$z]=1 found=1
+            for p in "${protected[@]}"; do [[ $z == "$p" ]] && continue 2; done
+            unzip_file "$z"
+        done < <(find "$1" -mindepth 1 "${depth[@]}" -xdev \( "${prune[@]}" \) -prune -o \
+                     -type f -iname '*.zip' \( "${fresh[@]}" \) -print0)
+        ((found)) || break
+    done
+}
+
 # Adds FILE (found under SRC) to organize's list of files to move when its extension (or
 # contents) belong to a category. A loose file in ORGANIZE_ROOT always moves: to Documents
 # when no category fits (subtitles wait for their video). A file already in its category's
@@ -724,6 +793,8 @@ has_video() {
 pick_file() {
     local f=$1 src=$2 cat ext p
     for p in "${protected[@]}"; do [[ $f == "$p" ]] && return 0; done
+    # A dry run didn't really unzip (and delete) it.
+    [[ -n ${DRY_RUN:-} && -n ${unzip_tried[$f]:-} ]] && return 0
     category_of cat "$f"
     [[ -n $cat && $src == "$root/$cat" ]] && return 0
     if [[ -z $cat && $src == "$root" ]]; then
@@ -883,6 +954,11 @@ organize() {
     for d in "${keep[@]}"; do prune+=(-o -path "$d"); done
 
     echo "== $(date '+%F %T') ${tidy:+tidy + }organize ${only:-$root}${DRY_RUN:+ (dry run)}"
+    # 0. Loose zips first, so the folders they unzip into are gone through below.
+    local -A unzip_tried=() moved_in=() moved_out=()
+    local unzipped=0 has_unzip=1 fresh=(-mmin +10)
+    command -v unzip >/dev/null || { has_unzip=; echo "  [WARN] no unzip: install it to have zips unzipped" >&2; }
+    [[ -n $has_unzip && -z $only && $ORGANIZE_LOOSE == 1 ]] && unzip_all --loose "$root"
     # 1. The folders to go through: only PATH (even if it's excluded or backed up), or all of
     # ORGANIZE_ROOT's that aren't kept out.
     local srcs=()
@@ -900,11 +976,14 @@ organize() {
     if [[ -n $tidy ]]; then
         for cat in "${CATEGORIES[@]}"; do [[ -d $root/$cat ]] && srcs+=("$root/$cat"); done
     fi
+    if [[ -n $has_unzip ]]; then
+        for src in "${srcs[@]}"; do unzip_all "$src"; done
+    fi
     # 2. The files to move.
     local pick_f=() pick_src=() pick_cat=()
     for src in "${srcs[@]}"; do
         while IFS= read -r -d '' f; do pick_file "$f" "$src"; done \
-            < <(find "$src" -mindepth 1 -xdev \( "${prune[@]}" \) -prune -o -type f -mmin +10 -print0)
+            < <(find "$src" -mindepth 1 -xdev \( "${prune[@]}" \) -prune -o -type f \( "${fresh[@]}" \) -print0)
     done
     if [[ -z $only && $ORGANIZE_LOOSE == 1 ]]; then
         while IFS= read -r -d '' f; do pick_file "$f" "$root"; done \
@@ -918,7 +997,6 @@ organize() {
         idx_scan "$root/$cat"
         idx_keep_backup_only "$root/$cat"
     done
-    local -A moved_in=() moved_out=()
     for i in "${!pick_f[@]}"; do
         organize_file "${pick_f[i]}" "${pick_src[i]}" "${pick_cat[i]}"
     done
@@ -937,7 +1015,7 @@ organize() {
             idx_write "$root/$cat"
         done
     fi
-    echo "== organize: moved $moved, trashed $trashed duplicates, failed $failed"
+    echo "== organize: unzipped $unzipped, moved $moved, trashed $trashed duplicates, failed $failed"
     ((failed == 0))
 }
 
