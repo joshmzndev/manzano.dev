@@ -152,8 +152,9 @@ usage() {
     cat <<'EOF'
 Usage: backup.sh COMMAND
 
-  setup              write rclone.conf (asks for the encryption password; a random salt
-                     is generated and printed once), and a commented .env if there is none
+  setup              install missing prerequisites (asks first), write rclone.conf (asks
+                     for the encryption password; a random salt is generated and printed
+                     once), and a commented .env if there is none
   check              key + delegation (as noreply@), then the rclone remotes
   backup             sync every folder in BACKUP_DIRS (default: ~/Documents, ~/Videos,
                      ~/Music, ~/Pictures, ~/Desktop), then delete archive/ versions older
@@ -178,13 +179,18 @@ Usage: backup.sh COMMAND
                      missing and put each one's directory.json from the backup inside
   forget PATH        really remove PATH (e.g. current/Pictures/old.jpg) from the backup:
                      it moves to archive/<time>/ and is deleted after ARCHIVE_KEEP_DAYS
+  free [PATH] [--yes]
+                     delete files in ~/Music, ~/Pictures, ~/Videos, ~/Documents (or only
+                     under PATH in one of them) that are already in the backup with the
+                     same contents (checked on Drive), to free space; asks first. They stay
+                     in the backup and in directory.json ("local": false)
   install            systemd user timer: backup BOOT_DELAY after boot + every hour
   uninstall          remove that timer
   status             timer state + the end of today's log
 
 Settings: CONFIG at the top of the script; override any of them in .env or the environment.
-DRY_RUN=1: sync/backup/organize/tidy/restore/forget only show what they would do.
-backup/organize/sync log to STATE_DIR/logs/ (and the terminal, when there is one).
+DRY_RUN=1: sync/backup/organize/tidy/restore/forget/free only show what they would do.
+backup/organize/sync/forget/free log to STATE_DIR/logs/ (and the terminal, when there is one).
 EOF
 }
 
@@ -347,8 +353,51 @@ EOF
     echo "Wrote $ENV_FILE (all defaults, commented out)."
 }
 
+# What setup installs when it's missing, one per line: "CHECK|apt-get|dnf|pacman|zypper"
+# package. CHECK is a command (any of several, space-separated) or py:MODULE. rclone itself
+# comes from rclone.org/install.sh (which needs curl + unzip), as distro ones can be < v1.53.
+readonly PREREQS=(
+    "curl|curl|curl|curl|curl"
+    "unzip|unzip|unzip|unzip|unzip"
+    "file|file|file|file|file"
+    "gio trash-put|libglib2.0-bin|glib2|glib2|glib2-tools"
+    "python3|python3|python3|python|python3"
+    "py:google.oauth2.service_account|python3-google-auth|python3-google-auth|python-google-auth|python3-google-auth"
+    "py:googleapiclient.discovery|python3-googleapi|python3-google-api-client|python-google-api-python-client|python3-google-api-python-client"
+)
+
+# Installs the missing PREREQS with the system package manager, after asking. Never fatal:
+# without them only some steps fail or are skipped (see check, organize).
+install_prereqs() {
+    local pm= i=0 entry test ok py=${PYTHON:-python3}
+    local -a cols missing=() pkgs=()
+    for pm in apt-get dnf pacman zypper; do command -v "$pm" >/dev/null && break; pm=; done
+    case $pm in apt-get) i=1 ;; dnf) i=2 ;; pacman) i=3 ;; zypper) i=4 ;; esac
+    for entry in "${PREREQS[@]}"; do
+        IFS='|' read -ra cols <<<"$entry"
+        ok=
+        for test in ${cols[0]}; do
+            if [[ $test == py:* ]]; then "$py" -c "import ${test#py:}" 2>/dev/null && ok=1
+            else command -v "$test" >/dev/null && ok=1; fi
+        done
+        [[ $ok ]] || { missing+=("${cols[0]}"); pkgs+=("${cols[i]}"); }
+    done
+    ((${#missing[@]})) || return 0
+    if [[ -z $pm ]]; then
+        echo "[WARN] missing, install them yourself: ${missing[*]}" >&2; return 0
+    fi
+    ask "Missing: ${missing[*]}. Install ${pkgs[*]} with $pm (sudo)?" || return 0
+    case $pm in
+        apt-get) sudo apt-get update && sudo apt-get install -y "${pkgs[@]}" ;;
+        dnf) sudo dnf install -y "${pkgs[@]}" ;;
+        pacman) sudo pacman -S --needed --noconfirm "${pkgs[@]}" ;;
+        zypper) sudo zypper --non-interactive install "${pkgs[@]}" ;;
+    esac || echo "[WARN] $pm couldn't install everything; setup continues." >&2
+}
+
 setup() {
     [[ -f $ENV_FILE ]] || write_env_template
+    install_prereqs
     if ! command -v rclone >/dev/null; then
         ask "rclone is not installed. Install it now with rclone.org/install.sh (sudo)?" \
             || die "Install rclone (v1.53+): https://rclone.org/install/"
@@ -481,10 +530,12 @@ sync_() {
     if [[ -n $BACKUP_FILTER ]]; then filters+=(--filter-from "$(abspath "$BACKUP_FILTER")"); fi
     # --one-file-system: don't follow USB drives or FUSE/rclone mounts inside SRC.
     # --links: symlinks are stored as .rclonelink files (restore puts them back).
+    # No --fast-list: once current/NAME held a few thousand files in many folders, a copy
+    # with it sat at "0 B / 0 B" listing Drive for minutes; folder by folder it's done in a few.
     rc "$mode" "$src" "gcrypt:current/$name" \
         "${filters[@]}" --filter-from - --ignore-case \
         --exclude-if-present .nobackup --exclude-if-present CACHEDIR.TAG \
-        --one-file-system --links --skip-specials --fast-list \
+        --one-file-system --links --skip-specials \
         --backup-dir "gcrypt:archive/$(date +%F_%H%M%S)/$name" \
         --drive-stop-on-upload-limit \
         --stats 1m --stats-one-line -v ${DRY_RUN:+--dry-run} <<<"$FILTER_RULES"
@@ -1216,6 +1267,90 @@ forget() {
     done
 }
 
+# Deletes local files in the four category folders (or only under PATH in one of them)
+# whose identical contents are already in current/ on Drive, checked by rclone cryptcheck
+# (the checksum of each encrypted file there). Those folders are only added to, so the
+# backup keeps the files, and directory.json keeps them as "local": false. Mirrored folders
+# are refused: the next backup would move their deleted files to archive/, and
+# prune_archive deletes them for good after ARCHIVE_KEEP_DAYS. Asks first, unless --yes.
+free() {
+    need
+    local yes= arg only= root cat dir name sub src dst stamp match f p size n=0 total=0 freed=0 failed=0
+    local -a dirs=() opts=() files=()
+    for arg in "$@"; do
+        if [[ $arg == --yes || $arg == -y ]]; then yes=1
+        elif [[ -z $only ]]; then
+            only=$(realpath -e -- "${arg/#\~/$HOME}" 2>/dev/null) || die "Not found: $arg"
+        else die "usage: free [PATH] [--yes]"
+        fi
+    done
+    root=$(abspath "$ORGANIZE_ROOT") ORG_ROOT=$root
+    for cat in "${CATEGORIES[@]}"; do
+        dir=$root/$cat
+        [[ -z $only || $only == "$dir" || $only == "$dir"/* ]] || continue
+        if ! backup_name "$dir" >/dev/null; then
+            [[ -z $only ]] || die "$dir isn't in BACKUP_DIRS, so nothing in it is backed up."
+            continue
+        fi
+        [[ -d $dir ]] && dirs+=("$dir")
+    done
+    [[ -z $only || ${#dirs[@]} -gt 0 ]] ||
+        die "free only works in $root/{$(IFS=,; echo "${CATEGORIES[*]}")}: other folders are mirrored, so a file deleted there is deleted from the backup too."
+    [[ $only != */"$INDEX_NAME" ]] || die "$INDEX_NAME stays: it lists what's only in the backup."
+    lock
+    IDX_OLD=() IDX_SIZE=() IDX_MTIME=() IDX_HASH=() BY_HASH=() BACKUP_ONLY=()
+    echo "== $(date '+%F %T') free ${only:-${dirs[*]}}${DRY_RUN:+ (dry run)}"
+    # $stamp's time is when checking starts: a file modified after it may not be the version
+    # in the backup.
+    stamp=$(mktemp) match=$(mktemp)
+    CLEAN_TMP=("$stamp" "$match")
+    for dir in "${dirs[@]}"; do
+        name=$(backup_name "$dir") sub=
+        [[ -n $only && $only != "$dir" ]] && sub=${only#"$dir"/}
+        src=$dir dst=gcrypt:current/$name
+        if [[ -f $only ]]; then
+            opts=(--files-from-raw -)   # just $sub, read from stdin
+        else
+            [[ -n $sub ]] && src=$dir/$sub dst=$dst/$sub
+            # directory.json stays; hidden files aren't in it, and are left alone like organize does.
+            opts=(--exclude "/$INDEX_NAME" --exclude '.*' --exclude '.*/**')
+        fi
+        echo "  checking $src against $dst"
+        # A file that's missing or different there fails the check (and isn't in $match), so
+        # rclone's exit code says nothing; make sure Drive is reachable instead.
+        rc lsf --max-depth 1 "$dst" >/dev/null 2>&1 ||
+            { echo "  [FAIL] can't read $dst" >&2; failed=$((failed + 1)); continue; }
+        : >"$match"
+        # Files changed in the last 10 minutes may still be changing (or not backed up yet).
+        rc cryptcheck "$src" "$dst" --one-way --match "$match" --min-age 10m "${opts[@]}" \
+            --one-file-system --skip-specials <<<"$sub" >/dev/null 2>&1 || true
+        while IFS= read -r f; do
+            p=$src/$f
+            [[ -n $f && -f $p && ! -L $p ]] || continue
+            echo "  backed up: ${p#"$root"/}"
+            files+=("$p") n=$((n + 1)) total=$((total + $(stat -c %s -- "$p")))
+        done <"$match"
+    done
+    echo "== $n file(s), $(numfmt --to=iec "$total")B, already in the backup"
+    ((n)) && [[ -z ${DRY_RUN:-} ]] || return "$((failed > 0))"
+    [[ -n $yes ]] || ask "Delete them from this computer for good (they stay in the backup)?" ||
+        { echo "== nothing deleted"; return 0; }
+    # Index everything first, so each deleted file keeps its entry, as "local": false.
+    for dir in "${dirs[@]}"; do idx_load "$dir"; idx_scan "$dir"; idx_keep_backup_only "$dir"; done
+    for p in "${files[@]}"; do
+        if [[ $p -nt $stamp ]]; then echo "  [SKIP] ${p#"$root"/} changed meanwhile"; continue; fi
+        size=$(stat -c %s -- "$p") || continue
+        if rm -f -- "$p" && [[ ! -e $p ]]; then
+            BACKUP_ONLY[$p]=1 freed=$((freed + size))
+        else
+            echo "  [FAIL] could not delete $p" >&2; failed=$((failed + 1))
+        fi
+    done
+    for dir in "${dirs[@]}"; do idx_write "$dir"; done
+    echo "== free: deleted $(numfmt --to=iec "$freed")B, failed $failed"
+    ((failed == 0))
+}
+
 restore() {
     need
     (($#)) || { restore_indexes; return; }
@@ -1306,6 +1441,7 @@ case ${1:-} in
     ls) need; rc lsf "gcrypt:${2:-}" ;;
     restore) shift; restore "$@" ;;
     forget) shift; start_log forget "$@"; forget "$@" ;;
+    free) shift; start_log free "$@"; free "$@" ;;
     formats) shift; formats "$@" ;;
     *) usage; exit 2 ;;
 esac

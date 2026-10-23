@@ -33,6 +33,9 @@ setting without editing the script: put the same line in a `.env` file next to i
   later, and organize still counts it as "already have it" (see below). Removing a file from
   the backup for real takes a separate command: `./backup.sh forget current/Pictures/old.jpg`.
   That moves it to `archive/`, so it's deleted after 90 days like any old version.
+  To free space, `./backup.sh free` deletes the files in these four folders that are
+  already in the backup with the same contents (checked on Drive first; it asks before
+  deleting). `./backup.sh free ~/Videos/2023` does only that folder.
 - **Other folders are mirrored.** For `~/Desktop` and any other folder you add, `current/`
   matches the folder exactly. A file deleted there moves to `archive/` and is deleted after
   90 days.
@@ -163,7 +166,7 @@ and use its storage.
 
 ```bash
 cd ~ && curl -fsSLo backup.sh <URL> && chmod +x backup.sh
-./backup.sh setup     # installs rclone if needed, asks for an encryption password
+./backup.sh setup     # installs what is missing (asks first), asks for an encryption password
 ./backup.sh check     # confirms the key, the delegation and the Drive connection
 ./backup.sh backup    # first backup (can take long the first time)
 ./backup.sh install   # run it at boot and every hour from now on
@@ -175,8 +178,8 @@ or Google, such as a password manager. A copy of `rclone.conf` also works. If yo
 the backup can never be decrypted.
 
 `check` can also confirm the delegation directly with Google if the Python packages are
-installed (`pip install google-api-python-client google-auth`). Without them it skips that
-step and only tests rclone.
+installed (`setup` offers to install them, or `pip install google-api-python-client
+google-auth`). Without them it skips that step and only tests rclone.
 
 ---
 
@@ -194,9 +197,10 @@ step and only tests rclone.
 | `./backup.sh restore` | Create `~/Music`, `~/Pictures`, `~/Videos`, `~/Documents` if missing and put each one's `directory.json` from the backup inside. |
 | `./backup.sh sync SRC [NAME]` | Back up one extra folder once, to `current/NAME`. |
 | `./backup.sh forget current/PATH` | Really remove a file or folder from the backup (it's moved to `archive/` and deleted after 90 days). |
+| `./backup.sh free [PATH] [--yes]` | Delete files in Music, Pictures, Videos, Documents (or only under PATH) that are already backed up with the same contents, to free space. Asks first unless `--yes`; they stay in the backup. |
 | `./backup.sh uninstall` | Stop the hourly backups (logs are kept). |
 
-Put `DRY_RUN=1` in front of `backup`, `organize`, `tidy`, `sync`, `restore` or `forget` to see what would
+Put `DRY_RUN=1` in front of `backup`, `organize`, `tidy`, `sync`, `restore`, `forget` or `free` to see what would
 happen without changing anything.
 
 ### Getting files back
