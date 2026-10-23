@@ -140,6 +140,10 @@ FILTER_RULES='
 - .~lock.*#
 # disk and VM images
 - *.{iso,img,qcow2,vdi,vmdk,vhd,vhdx}
+# organize temp files a run that was killed outright left behind (the next organize removes them)
+- .unzip.??????/**
+- .directory.json.??????*
+- .organize.??????
 '
 
 die() { echo "$*" >&2; exit 1; }
@@ -256,7 +260,9 @@ start_log() {
     (umask 077; mkdir -p "$LOG_DIR"; touch "$LOG_DIR/$(date +%F).log")
     find "$LOG_DIR" -name '*.log' -mtime +"$LOG_KEEP_DAYS" -delete 2>/dev/null || true
     local log="$LOG_DIR/$(date +%F).log"
-    if [[ -t 1 ]]; then exec > >(tee -a "$log") 2>&1; else exec >>"$log" 2>&1; fi
+    # tee ignores the stop signals: Ctrl-C would kill it first, and the end of the run (with
+    # the "stopped" line) would never reach the log.
+    if [[ -t 1 ]]; then exec > >(trap '' INT TERM HUP; exec tee -a "$log") 2>&1; else exec >>"$log" 2>&1; fi
     echo "== $(date '+%F %T') backup.sh $*"
 }
 
@@ -272,6 +278,28 @@ lock() {
     fi
     LOCKED=1
 }
+
+# The temp file/folder being worked on right now (unzip_file, idx_write, move_file, setup),
+# removed if the run is stopped. Ctrl-C, systemd's stop and a closed terminal go through
+# exit, so the EXIT trap runs for them too.
+CLEAN_TMP=()
+clean_tmp() { ((${#CLEAN_TMP[@]} == 0)) || rm -rf -- "${CLEAN_TMP[@]}"; }
+
+# Between defer_stop and allow_stop (a few quick steps that must not be split up), a stop
+# waits for allow_stop. Child processes still get the signal, so those steps check what
+# really happened rather than trusting exit codes.
+STOP_DEFERRED= STOP_PENDING=
+on_stop() {
+    if [[ -n $STOP_DEFERRED ]]; then STOP_PENDING="$1 $2"; return; fi
+    echo "== $(date '+%F %T') stopped by $1; run the same command again to continue" || true
+    exit "$2"
+}
+defer_stop() { STOP_DEFERRED=1; }
+allow_stop() { STOP_DEFERRED=; [[ -z $STOP_PENDING ]] || on_stop $STOP_PENDING; }
+trap clean_tmp EXIT
+trap 'on_stop SIGINT 130' INT
+trap 'on_stop SIGTERM 143' TERM
+trap 'on_stop SIGHUP 129' HUP
 
 # --- rclone -----------------------------------------------------------------------------
 
@@ -330,12 +358,19 @@ setup() {
     make_private
     [[ -e $RCLONE_CONFIG ]] && die "$RCLONE_CONFIG already exists. It holds the encryption
 password: only delete it to start a new, empty backup."
-    local pw pw2 salt
+    local pw pw2 salt obscured obscured2 tmp
     read -rsp "Encryption password: " pw </dev/tty; echo
     read -rsp "Again: " pw2 </dev/tty; echo
     [[ -n $pw && $pw == "$pw2" ]] || die "Passwords are empty or don't match."
     salt=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-    (umask 077; mkdir -p "$(dirname "$RCLONE_CONFIG")"; cat >"$RCLONE_CONFIG" <<EOF
+    obscured=$(printf %s "$pw" | rclone obscure -)
+    obscured2=$(printf %s "$salt" | rclone obscure -)
+    # Written in full to a temp file (mode 600) and then renamed: a stopped setup leaves no
+    # half-written rclone.conf that a rerun would refuse to replace.
+    (umask 077; mkdir -p "$(dirname "$RCLONE_CONFIG")")
+    tmp=$(mktemp "$RCLONE_CONFIG.XXXXXX")
+    CLEAN_TMP=("$tmp")
+    cat >"$tmp" <<EOF
 [gdrive]
 type = drive
 scope = drive
@@ -347,10 +382,11 @@ type = crypt
 remote = gdrive:$REMOTE_DIR
 filename_encryption = standard
 directory_name_encryption = true
-password = $(printf %s "$pw" | rclone obscure -)
-password2 = $(printf %s "$salt" | rclone obscure -)
+password = $obscured
+password2 = $obscured2
 EOF
-    )
+    mv -f -- "$tmp" "$RCLONE_CONFIG"
+    CLEAN_TMP=()
     make_private
     cat <<EOF
 Wrote $RCLONE_CONFIG (mode 600). Backups go to $BOT_EMAIL's Drive, folder $REMOTE_DIR/.
@@ -497,16 +533,19 @@ backup() {
     echo "== $(date '+%F %T') done"
 }
 
-# PATH, or "PATH (1).ext", "PATH (2).ext", ... whichever isn't taken yet, here or by a file
-# that's only in the backup (which a new file there would replace), or by an earlier move in
-# a dry run. A name without an extension gets " (1)" at the end.
+# Sets VAR to PATH, or "PATH (1).ext", "PATH (2).ext", ... whichever isn't taken yet, here or
+# by a file that's only in the backup (which a new file there would replace), or by an
+# earlier move in a dry run. A name without an extension gets " (1)" at the end. Sets a
+# variable rather than printing, so no $(...) subshell can be killed halfway by a stop.
 taken() { [[ -e $1 || ${BACKUP_ONLY[$1]:-} == 1 || -n ${moved_in[$1]:-} ]]; }
 unique_path() {
-    local p=$1 base=$1 ext= n=1
-    taken "$p" || { printf %s "$p"; return; }
-    [[ ${p##*/} == ?*.* ]] && base=${p%.*} ext=.${p##*.}
-    while taken "$base ($n)$ext"; do n=$((n + 1)); done
-    printf %s "$base ($n)$ext"
+    local p=$2 base=$2 ext= n=1
+    if taken "$p"; then
+        [[ ${p##*/} == ?*.* ]] && base=${p%.*} ext=.${p##*.}
+        while taken "$base ($n)$ext"; do n=$((n + 1)); done
+        p="$base ($n)$ext"
+    fi
+    printf -v "$1" %s "$p"
 }
 
 # --- checksum index: directory.json in each of the four target folders -------------------
@@ -616,6 +655,7 @@ idx_write() {
         [[ -e $p || ${BACKUP_ONLY[$p]:-} == 1 ]] && rels+=("${p#"$dir"/}")
     done
     tmp=$(mktemp "$dir/.$INDEX_NAME.XXXXXX")
+    CLEAN_TMP=("$tmp" "$tmp.files")
     json_esc folder "$dir"
     {
         while IFS= read -r -d '' rel; do
@@ -637,6 +677,7 @@ idx_write() {
     } >"$tmp"
     rm -f -- "$tmp.files"
     chmod 644 -- "$tmp"; mv -f -- "$tmp" "$dir/$INDEX_NAME"
+    CLEAN_TMP=()
 }
 
 # Moves FILE to the desktop Trash, so it can be restored from the file manager.
@@ -648,6 +689,35 @@ trash_file() {
     else
         echo "  [FAIL] no gio or trash-put: install libglib2.0-bin or trash-cli" >&2; return 1
     fi
+}
+
+# Moves FILE to DEST (a free name) like mv -n; true when FILE is gone. Across filesystems mv
+# copies straight to DEST, and a stopped run would leave half a file there: the copy goes to
+# a hidden temp file instead (in DEST's category folder, where organize looks for leftovers),
+# which is renamed to DEST once it's complete.
+move_file() {
+    local f=$1 dest=$2 rel top tmp
+    if [[ $(stat -c %d -- "$f") == "$(stat -c %d -- "${dest%/*}")" ]]; then
+        mv -n -- "$f" "$dest" || true
+        [[ ! -e $f ]]; return
+    fi
+    top=${dest%/*}
+    if [[ $dest == "$ORG_ROOT"/*/* ]]; then rel=${dest#"$ORG_ROOT"/} top=$ORG_ROOT/${rel%%/*}; fi
+    tmp=$(mktemp "$top/.organize.XXXXXX") || return 1
+    CLEAN_TMP=("$tmp")
+    if ! cp -p -- "$f" "$tmp"; then rm -f -- "$tmp"; CLEAN_TMP=(); return 1; fi
+    # The copy is complete. Until the original is gone a stop waits, so the file never ends
+    # up in both places.
+    defer_stop
+    mv -n -- "$tmp" "$dest" || true
+    if [[ ! -e $tmp ]]; then
+        CLEAN_TMP=()
+        rm -f -- "$f" || true
+        if [[ -e $f ]]; then rm -f -- "$dest"; fi   # the original can't be deleted: undo
+    fi
+    rm -f -- "$tmp"; CLEAN_TMP=()
+    allow_stop
+    [[ ! -e $f ]]
 }
 
 # .ts is TypeScript as often as MPEG-TS video, which has a 0x47 sync byte every 188 bytes.
@@ -662,10 +732,10 @@ move_subtitles() {
     for e in $SUB_EXTS; do
         for s in "$base.$e" "$base".*."$e"; do
             [[ -f $s ]] || continue
-            to=$(unique_path "${dest%.*}${s#"$base"}")
+            unique_path to "${dest%.*}${s#"$base"}"
             echo "  ${s#"$ORG_ROOT"/} -> ${to#"$ORG_ROOT"/}"
             [[ -n ${DRY_RUN:-} ]] && continue
-            mv -n -- "$s" "$to" && [[ ! -e $s ]] || echo "  [FAIL] could not move $s" >&2
+            move_file "$s" "$to" || echo "  [FAIL] could not move $s" >&2
         done
     done
     return 0
@@ -734,37 +804,45 @@ unzip_file() {
         return 0
     fi
     tmp=$(mktemp -d "$dir/.unzip.XXXXXX") || { echo "  [FAIL] could not unzip $z" >&2; failed=$((failed + 1)); return 0; }
+    # Until the zip is deleted below, what's in tmp is only a copy: safe to remove if stopped.
+    CLEAN_TMP=("$tmp")
     if ! unzip -qq -P '' -d "$tmp" "$z" </dev/null >/dev/null 2>&1; then
         echo "  [WARN] could not unzip ${z#"$root"/} (damaged or password-protected?), leaving it" >&2
-        rm -rf -- "$tmp"
+        rm -rf -- "$tmp"; CLEAN_TMP=()
         return 0
     fi
     rm -rf -- "$tmp/__MACOSX"
-    while IFS= read -r -d '' to; do entries+=("$to"); done \
-        < <(find "$tmp" -mindepth 1 -maxdepth 1 -print0)
+    for to in "$tmp"/* "$tmp"/.[!.]* "$tmp"/..?*; do [[ -e $to || -L $to ]] && entries+=("$to"); done
+    # From the move out of tmp until the zip is deleted, a stop waits: the files would be both
+    # unzipped and still in the zip, and the next run would unzip them a second time.
+    defer_stop
     if ((${#entries[@]} == 1)) && [[ -d ${entries[0]} && ! -L ${entries[0]} ]]; then
-        to=$(unique_path "$dir/${entries[0]##*/}")
-        mv -n -- "${entries[0]}" "$to" && rmdir -- "$tmp" || true
+        unique_path to "$dir/${entries[0]##*/}"
+        mv -n -- "${entries[0]}" "$to" || true
+        rmdir -- "$tmp" 2>/dev/null || true   # only works when the move did
     elif ((${#entries[@]} == 0)); then
         to=; rmdir -- "$tmp" || true
     else
-        to=$(unique_path "${z%.*}")
+        unique_path to "${z%.*}"
         mv -n -- "$tmp" "$to" || true
     fi
     if [[ -e $tmp ]]; then
-        echo "  [FAIL] could not move what $z holds out of $tmp" >&2; failed=$((failed + 1)); return 0
+        echo "  [FAIL] could not move what $z holds out of $tmp" >&2; failed=$((failed + 1))
+        allow_stop; return 0
     fi
+    CLEAN_TMP=()
     echo "  ${z#"$root"/} -> ${to:+unzipped into ${to#"$root"/}/, }zip deleted"
     # Its files keep their dates from the zip: don't wait 10 minutes for recently zipped ones.
     if [[ -n $to ]]; then
         local pat=${to//\\/\\\\}; pat=${pat//\*/\\*}; pat=${pat//\?/\\?}; pat=${pat//\[/\\[}
         fresh+=(-o -path "$pat/*")
     fi
-    if rm -f -- "$z"; then
+    if rm -f -- "$z" && [[ ! -e $z ]]; then
         unzipped=$((unzipped + 1))
     else
         echo "  [FAIL] could not delete $z" >&2; failed=$((failed + 1))
     fi
+    allow_stop
 }
 
 # Unzips every .zip under SRC that organize looks at (same PRUNE rules, not changed in the
@@ -835,7 +913,7 @@ organize_file() {
         return 0
     fi
     rel=${f#"$src"/}
-    dest=$(unique_path "$root/$cat/$rel")
+    unique_path dest "$root/$cat/$rel"
     echo "  ${f#"$root"/} -> ${dest#"$root"/}"
     read -r size mtime < <(stat -c '%s %Y' -- "$f")
     if [[ -n ${DRY_RUN:-} ]]; then
@@ -844,12 +922,17 @@ organize_file() {
         [[ $cat == Videos ]] && move_subtitles "$f" "$dest"
         return 0
     fi
-    if mkdir -p "$(dirname "$dest")" && mv -n -- "$f" "$dest" && [[ ! -e $f ]]; then
+    mkdir -p "$(dirname "$dest")" || { echo "  [FAIL] could not move $f" >&2; failed=$((failed + 1)); return 0; }
+    # Subtitles first: if the run stops in between, the video is still here and the next run
+    # moves it to the same place, next to them (alone, subtitles would never move).
+    [[ $cat == Videos ]] && move_subtitles "$f" "$dest"
+    if move_file "$f" "$dest"; then
         moved=$((moved + 1)) moved_in[$dest]=1 moved_out[$f]=1
         idx_add "$dest" "$size" "$mtime" "$h"
-        [[ $cat == Videos ]] && move_subtitles "$f" "$dest"
     else
         echo "  [FAIL] could not move $f" >&2; failed=$((failed + 1))
+        # Its subtitles went ahead: put them back next to it.
+        [[ $cat == Videos ]] && move_subtitles "$dest" "$f"
     fi
     return 0
 }
@@ -909,6 +992,25 @@ dedupe_folder() {
     return 0
 }
 
+# Removes what a run that was killed outright (no EXIT trap) left under DIR: .unzip.* folders
+# (their zip is still there, so they're only a copy), move_file's .organize.* copies (the
+# original is still there too) and directory.json temp files. Hidden,
+# so organize never looks at them otherwise. Extra find args (e.g. -maxdepth 1) go first.
+# Uses organize's locals (we hold the lock: no other run is using them).
+clean_stale() {
+    local dir=$1 p
+    shift
+    while IFS= read -r -d '' p; do
+        echo "  removing ${p#"$root"/}, left by a run that was stopped"
+        [[ -n ${DRY_RUN:-} ]] && continue
+        rm -rf -- "$p" || echo "  [FAIL] could not remove $p" >&2
+    done < <(find "$dir" -mindepth 1 "$@" -xdev \
+                 \( -type d -name '.unzip.??????' -prune -print0 \) -o \
+                 \( -type f \( -name ".$INDEX_NAME.??????" -o -name ".$INDEX_NAME.??????.files" \
+                               -o -name '.organize.??????' \) -print0 \) -o \
+                 \( "${prune[@]}" \) -prune)
+}
+
 # Moves files by extension from the other folders in ORGANIZE_ROOT (or only from PATH) into
 # its category folders, or to the Trash when the same contents are already in one of them.
 # With --tidy (the tidy command), also goes through the four category folders themselves:
@@ -958,6 +1060,8 @@ organize() {
     local -A unzip_tried=() moved_in=() moved_out=()
     local unzipped=0 has_unzip=1 fresh=(-mmin +10)
     command -v unzip >/dev/null || { has_unzip=; echo "  [WARN] no unzip: install it to have zips unzipped" >&2; }
+    [[ -z $only && $ORGANIZE_LOOSE == 1 ]] && clean_stale "$root" -maxdepth 1
+    for cat in "${CATEGORIES[@]}"; do [[ -d $root/$cat ]] && clean_stale "$root/$cat" -maxdepth 1; done
     [[ -n $has_unzip && -z $only && $ORGANIZE_LOOSE == 1 ]] && unzip_all --loose "$root"
     # 1. The folders to go through: only PATH (even if it's excluded or backed up), or all of
     # ORGANIZE_ROOT's that aren't kept out.
@@ -976,6 +1080,7 @@ organize() {
     if [[ -n $tidy ]]; then
         for cat in "${CATEGORIES[@]}"; do [[ -d $root/$cat ]] && srcs+=("$root/$cat"); done
     fi
+    for src in "${srcs[@]}"; do clean_stale "$src"; done
     if [[ -n $has_unzip ]]; then
         for src in "${srcs[@]}"; do unzip_all "$src"; done
     fi
@@ -996,6 +1101,9 @@ organize() {
         idx_load "$root/$cat"
         idx_scan "$root/$cat"
         idx_keep_backup_only "$root/$cat"
+        # Saved now as well, so the hashing isn't lost if the run is stopped before the end
+        # (an entry is only reused while the file's size and time still match).
+        [[ -z ${DRY_RUN:-} ]] && idx_ours "$root/$cat" && idx_write "$root/$cat"
     done
     for i in "${!pick_f[@]}"; do
         organize_file "${pick_f[i]}" "${pick_src[i]}" "${pick_cat[i]}"
