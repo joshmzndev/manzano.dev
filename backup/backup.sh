@@ -117,6 +117,8 @@ DEFAULT_BACKUP_DIRS=$BACKUP_DIRS
 FILTER_RULES='
 # this script (it sits in ~/Desktop/Bot)
 - backup.sh
+# git internals: the files of a repo are backed up, its history can be cloned again
+- .git/**
 # dependency and build folders
 - node_modules/**
 - __pycache__/**

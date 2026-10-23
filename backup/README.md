@@ -40,8 +40,9 @@ setting without editing the script: put the same line in a `.env` file next to i
   matches the folder exactly. A file deleted there moves to `archive/` and is deleted after
   90 days.
 - **What's left out.** Things that can be rebuilt or downloaded again: `node_modules`,
-  Python caches and virtualenvs, half-finished downloads (`.part`, `.crdownload`), editor
-  swap files, office lock files, and disk/VM images (`.iso`, `.img`, `.vdi`, …). A folder
+  Python caches and virtualenvs, the `.git` folder of git repos (their files are still
+  backed up; push to keep the history), half-finished downloads (`.part`, `.crdownload`),
+  editor swap files, office lock files, and disk/VM images (`.iso`, `.img`, `.vdi`, …). A folder
   containing a file named `.nobackup` or `CACHEDIR.TAG` is skipped entirely. You can add your
   own rules with `BACKUP_FILTER`.
 - **Safe with odd files.** Symlinks are saved and restored as symlinks. USB drives and
