@@ -185,7 +185,8 @@ Usage: backup.sh COMMAND
                      delete files in ~/Music, ~/Pictures, ~/Videos, ~/Documents (or only
                      under PATH in one of them) that are already in the backup with the
                      same contents (checked on Drive), to free space; asks first. They stay
-                     in the backup and in directory.json ("local": false)
+                     in the backup and in directory.json ("local": false). Folders left
+                     empty by that are removed too
   install            systemd user timer: backup BOOT_DELAY after boot + every hour
   uninstall          remove that timer
   status             timer state + the end of today's log
@@ -1274,11 +1275,13 @@ forget() {
 # (the checksum of each encrypted file there). Those folders are only added to, so the
 # backup keeps the files, and directory.json keeps them as "local": false. Mirrored folders
 # are refused: the next backup would move their deleted files to archive/, and
-# prune_archive deletes them for good after ARCHIVE_KEEP_DAYS. Asks first, unless --yes.
+# prune_archive deletes them for good after ARCHIVE_KEEP_DAYS. Folders emptied by the
+# deletions are removed, up to the category folder. Asks first, unless --yes.
 free() {
     need
-    local yes= arg only= root cat dir name sub src dst stamp match f p size n=0 total=0 freed=0 failed=0
+    local yes= arg only= root cat dir name sub src dst stamp match f p d size n=0 total=0 freed=0 failed=0
     local -a dirs=() opts=() files=()
+    local -A emptied=()
     for arg in "$@"; do
         if [[ $arg == --yes || $arg == -y ]]; then yes=1
         elif [[ -z $only ]]; then
@@ -1344,10 +1347,21 @@ free() {
         size=$(stat -c %s -- "$p") || continue
         if rm -f -- "$p" && [[ ! -e $p ]]; then
             BACKUP_ONLY[$p]=1 freed=$((freed + size))
+            # Its folders, up to (not including) the category folder, may be empty now.
+            for dir in "${dirs[@]}"; do [[ $p == "$dir"/* ]] && break; done
+            d=${p%/*}
+            while [[ $d == "$dir"/* ]]; do emptied[$d]=1 d=${d%/*}; done
         else
             echo "  [FAIL] could not delete $p" >&2; failed=$((failed + 1))
         fi
     done
+    # Deepest first, so a parent is emptied before it's checked. A folder with anything left
+    # in it (hidden files count) stays.
+    while IFS= read -r -d '' d; do
+        [[ -d $d && ! -L $d && -z $(find "$d" -mindepth 1 -print -quit) ]] || continue
+        echo "  removing empty folder ${d#"$root"/}/"
+        rmdir -- "$d" || { echo "  [FAIL] could not remove $d" >&2; failed=$((failed + 1)); }
+    done < <(((${#emptied[@]})) && printf '%s\0' "${!emptied[@]}" | sort -rz)
     for dir in "${dirs[@]}"; do idx_write "$dir"; done
     echo "== free: deleted $(numfmt --to=iec "$freed")B, failed $failed"
     ((failed == 0))

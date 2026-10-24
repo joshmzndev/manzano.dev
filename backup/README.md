@@ -198,7 +198,7 @@ google-auth`). Without them it skips that step and only tests rclone.
 | `./backup.sh restore` | Create `~/Music`, `~/Pictures`, `~/Videos`, `~/Documents` if missing and put each one's `directory.json` from the backup inside. |
 | `./backup.sh sync SRC [NAME]` | Back up one extra folder once, to `current/NAME`. |
 | `./backup.sh forget current/PATH` | Really remove a file or folder from the backup (it's moved to `archive/` and deleted after 90 days). |
-| `./backup.sh free [PATH] [--yes]` | Delete files in Music, Pictures, Videos, Documents (or only under PATH) that are already backed up with the same contents, to free space. Asks first unless `--yes`; they stay in the backup. |
+| `./backup.sh free [PATH] [--yes]` | Delete files in Music, Pictures, Videos, Documents (or only under PATH) that are already backed up with the same contents, to free space. Asks first unless `--yes`; they stay in the backup. Folders left empty are removed too. |
 | `./backup.sh uninstall` | Stop the hourly backups (logs are kept). |
 
 Put `DRY_RUN=1` in front of `backup`, `organize`, `tidy`, `sync`, `restore`, `forget` or `free` to see what would
