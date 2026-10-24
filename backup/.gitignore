@@ -1,6 +1,0 @@
-service_account.json
-*.json
-# Holds the (only obscured) encryption password and salt
-rclone.conf
-# Key path + backup list
-.env
