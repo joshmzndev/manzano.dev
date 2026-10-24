@@ -187,8 +187,8 @@ Usage: backup.sh COMMAND
                      same contents (checked on Drive), to free space; asks first. They stay
                      in the backup and in directory.json ("local": false). Folders left
                      empty by that are removed too
-  start              organize, then backup, then free without asking (free --yes); stops
-                     before free if the backup fails
+  start [PATH]       organize (only PATH, if given), then backup, then free without asking
+                     (free --yes, on all four folders); stops before free if the backup fails
   install            systemd user timer: backup BOOT_DELAY after boot + every hour
   uninstall          remove that timer
   status             timer state + the end of today's log
@@ -1376,12 +1376,15 @@ restore() {
     rc copy "gcrypt:$path" "$dest" --links --stats 1m --stats-one-line -v ${DRY_RUN:+--dry-run}
 }
 
-# organize, backup, free in one go, without asking: running start is the go-ahead for free.
+# organize (only PATH, if given), backup, free in one go, without asking: running start is
+# the go-ahead for free. free always goes through all four folders, since PATH is usually
+# somewhere organize moves files out of (e.g. ~/Downloads), not one of them.
 # organize failures don't stop it (backup does the same with ORGANIZE_ON_BACKUP), but a
 # failed backup does: backup dies before free runs.
 start() {
+    (($# <= 1)) || die "usage: start [PATH]"
     local failed=0
-    organize || failed=1
+    organize "$@" || failed=1
     ORGANIZE_ON_BACKUP=0 backup
     free --yes
     ((failed == 0)) || die "organize had failures; see above."
@@ -1471,7 +1474,7 @@ case ${1:-} in
     restore) shift; restore "$@" ;;
     forget) shift; start_log forget "$@"; forget "$@" ;;
     free) shift; start_log free "$@"; free "$@" ;;
-    start) start_log start; start ;;
+    start) shift; start_log start "$@"; start "$@" ;;
     formats) shift; formats "$@" ;;
     *) usage; exit 2 ;;
 esac
