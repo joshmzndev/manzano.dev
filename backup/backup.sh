@@ -77,7 +77,7 @@ ARCHIVE_KEEP_DAYS=90
 # ends up empty, unless it's in ORGANIZE_KEEP_EMPTY or it's the PATH given to organize.
 ORGANIZE_ROOT=~
 ORGANIZE_ON_BACKUP=0          # 1 = run organize at the start of every backup
-ORGANIZE_SKIP=snap,Templates,Public,bin,node_modules,venv   # folder names never entered
+ORGANIZE_SKIP=snap,Templates,Public,bin,node_modules,venv,Git,git   # folder names never entered
 ORGANIZE_EXCLUDE=~/Desktop    # folders (paths, comma-separated) never organized
 ORGANIZE_KEEP_EMPTY=Downloads # top-level folders kept even when organize empties them
 ORGANIZE_LOOSE=1              # 1 = also organize every loose file directly in ORGANIZE_ROOT
@@ -187,6 +187,8 @@ Usage: backup.sh COMMAND
                      same contents (checked on Drive), to free space; asks first. They stay
                      in the backup and in directory.json ("local": false). Folders left
                      empty by that are removed too
+  start              organize, then backup, then free without asking (free --yes); stops
+                     before free if the backup fails
   install            systemd user timer: backup BOOT_DELAY after boot + every hour
   uninstall          remove that timer
   status             timer state + the end of today's log
@@ -348,7 +350,7 @@ write_env_template() {
 #GOOGLE_SERVICE_ACCOUNT_FILE=service_account.json
 #BACKUP_DIRS=~/Documents,~/Videos,~/Music,~/Pictures,~/Desktop
 #ORGANIZE_ON_BACKUP=1
-#ORGANIZE_SKIP=snap,Templates,Public,bin,node_modules,venv
+#ORGANIZE_SKIP=snap,Templates,Public,bin,node_modules,venv,Git,git
 #ORGANIZE_EXCLUDE=~/Desktop
 #ORGANIZE_LOOSE=0
 EOF
@@ -1374,6 +1376,17 @@ restore() {
     rc copy "gcrypt:$path" "$dest" --links --stats 1m --stats-one-line -v ${DRY_RUN:+--dry-run}
 }
 
+# organize, backup, free in one go, without asking: running start is the go-ahead for free.
+# organize failures don't stop it (backup does the same with ORGANIZE_ON_BACKUP), but a
+# failed backup does: backup dies before free runs.
+start() {
+    local failed=0
+    organize || failed=1
+    ORGANIZE_ON_BACKUP=0 backup
+    free --yes
+    ((failed == 0)) || die "organize had failures; see above."
+}
+
 # What the timer runs. systemd never starts a second copy while one is running, so a tick
 # that falls inside a long backup is skipped by systemd; catch it up here as soon as we finish.
 scheduled() {
@@ -1458,6 +1471,7 @@ case ${1:-} in
     restore) shift; restore "$@" ;;
     forget) shift; start_log forget "$@"; forget "$@" ;;
     free) shift; start_log free "$@"; free "$@" ;;
+    start) start_log start; start ;;
     formats) shift; formats "$@" ;;
     *) usage; exit 2 ;;
 esac
