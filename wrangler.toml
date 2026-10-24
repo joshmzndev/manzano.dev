@@ -2,4 +2,4 @@ name = "scripts"
 compatibility_date = "2026-10-01"
 
 [assets]
-directory = "./"   # your build output folder
+directory = "." 
