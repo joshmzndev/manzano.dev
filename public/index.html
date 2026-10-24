@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scripts</title>
+<style>
+  :root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --code: #f4f4f4; --border: #e2e2e2; --link: #0b62d6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111; --fg: #e8e8e8; --muted: #999; --code: #1d1d1d; --border: #2c2c2c; --link: #6aa8ff; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 32px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  p.lead { margin: 0 0 8px; color: var(--muted); }
+  a { color: var(--link); }
+  dl { margin: 0; }
+  dt { margin-top: 18px; font-weight: 600; }
+  dt a { font-family: ui-monospace, monospace; }
+  dd { margin: 4px 0 0; }
+  pre { background: var(--code); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; overflow-x: auto; margin: 6px 0 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Scripts</h1>
+  <p class="lead">Personal scripts, served raw so they can be fetched with <code>curl</code> or <code>wget</code>.</p>
+  <pre>curl -fsSLO <span class="origin">https://example.com</span>/&lt;script&gt;</pre>
+
+  <h2>Setup</h2>
+  <dl>
+    <dt><a href="setup.sh">setup.sh</a></dt>
+    <dd>Updates apt, installs git with stored credentials, and installs Claude Code.
+      <pre>curl -fsSL <span class="origin">https://example.com</span>/setup.sh | bash</pre></dd>
+  </dl>
+
+  <h2>Backups</h2>
+  <dl>
+    <dt><a href="backup.sh">backup.sh</a></dt>
+    <dd>Encrypted rclone backups of local folders to Google Drive, an <code>organize</code> command that sorts stray media and documents, and a systemd timer for hourly runs. Commands: <code>setup</code>, <code>check</code>, <code>organize</code>, <code>backup</code>, <code>install</code>.
+      <pre>cd ~ &amp;&amp; curl -fsSLo backup.sh <span class="origin">https://example.com</span>/backup.sh &amp;&amp; chmod +x backup.sh</pre></dd>
+    <dt><a href="backup_secrets.sh">backup_secrets.sh</a></dt>
+    <dd>Encrypts <code>~/.config</code> files, <code>~/.ssh</code> and the GPG keyring with age (passphrase) into <code>config.age</code>, <code>ssh.age</code> and <code>gpg.age</code>.</dd>
+    <dt><a href="restore_secrets.sh">restore_secrets.sh</a></dt>
+    <dd>Reverses <code>backup_secrets.sh</code>: decrypts the <code>.age</code> files in the current folder and restores them under <code>~</code>.</dd>
+  </dl>
+
+  <h2>FreeRADIUS</h2>
+  <dl>
+    <dt><a href="mac_add.py">mac_add.py</a></dt>
+    <dd>Adds a MAC address (any common format) to the FreeRADIUS users file and reboots. Supports <code>--dry-run</code>, <code>--no-reboot</code> and <code>--users-file</code>.
+      <pre>sudo python3 mac_add.py AA:BB:CC:DD:EE:FF --dry-run</pre></dd>
+    <dt><a href="read_log.py">read_log.py</a></dt>
+    <dd>Tails a log file and reports MAC addresses that aren't yet authorized in FreeRADIUS.
+      <pre>python3 read_log.py /var/log/freeradius/radius.log</pre></dd>
+  </dl>
+
+  <h2>Windows</h2>
+  <dl>
+    <dt><a href="get_windows_key.bat">get_windows_key.bat</a></dt>
+    <dd>PowerShell one-liner that prints the OEM Windows product key stored in firmware.</dd>
+  </dl>
+</main>
+<script>
+  for (const el of document.querySelectorAll('.origin')) el.textContent = location.origin;
+</script>
+</body>
+</html>
