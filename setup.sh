@@ -9,3 +9,5 @@ sudo apt install -y git
 git config --global credential.helper store
 
 echo "git $(git --version | awk '{print $3}') installed; credentials will be saved on next login."
+
+curl -fsSL https://claude.ai/install.sh | bash
