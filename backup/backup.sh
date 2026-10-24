@@ -1477,4 +1477,4 @@ case ${1:-} in
     start) shift; start_log start "$@"; start "$@" ;;
     formats) shift; formats "$@" ;;
     *) usage; exit 2 ;;
-esac
+esac; exit # same line as esac: bash never reads past here, so editing the script mid-run is safe
