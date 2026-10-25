@@ -27,3 +27,39 @@ rclone.conf
 *.tar.gz
 *.tgz
 *.7z
+
+# Python virtual environments
+env/
+venv/
+.venv/
+ENV/
+pyvenv.cfg
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Python packaging/build output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-log.txt
+
+# Wrangler / Cloudflare local state
+.wrangler/
+.dev.vars
+node_modules/
+
+# Editor and OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
