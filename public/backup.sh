@@ -9,6 +9,8 @@
 #   DRY_RUN=1 ./backup.sh organize   # see what would move, then run it without DRY_RUN
 #   ./backup.sh backup
 #   ./backup.sh install   # systemd timer: backup at boot and every hour
+#   DRY_RUN=1 ./backup.sh start /media/me/DRIVE   # see the plan for a drive, then without DRY_RUN:
+#                         # uploads it straight to Drive, verifies, deletes it from the drive
 #   (or without saving it: curl -fsSL <URL> | bash -s -- backup, uses ./.env)
 #
 # Settings are in CONFIG right below; `usage` lists the commands; README.md covers the
@@ -148,6 +150,21 @@ FILTER_RULES='
 - .organize.??????
 '
 
+# Also left out by `start PATH` (and so left on PATH): clutter systems put on removable drives.
+INGEST_RULES='
+- .Trash-*/**
+- .Trashes/**
+- .Spotlight-V100/**
+- .fseventsd/**
+- .TemporaryItems/**
+- System Volume Information/**
+- $RECYCLE.BIN/**
+- .DS_Store
+- ._*
+- Thumbs.db
+- desktop.ini
+'
+
 die() { echo "$*" >&2; exit 1; }
 
 usage() {
@@ -187,9 +204,17 @@ Usage: backup.sh COMMAND
                      same contents (checked on Drive), to free space; asks first. They stay
                      in the backup and in directory.json ("local": false). Folders left
                      empty by that are removed too
-  start [PATH]       organize (only PATH, if given), then backup, then free without asking
-                     (free --yes, on all four folders); stops before free if the backup fails
-  install            systemd user timer: backup BOOT_DELAY after boot + every hour
+  start PATH         back up everything in PATH (e.g. a removable drive) straight to Drive,
+                     without copying it to this computer: each file goes to current/Pictures,
+                     Music, Videos or Documents (no category or a zip: Documents), keeping its
+                     subfolders. A different file already at that path is never overwritten
+                     (the new one gets " (1)"). Each file is checksum-verified against Drive
+                     and then DELETED from PATH, without asking; anything not verified stays.
+                     Git repos, .nobackup folders, symlinks and the FILTER_RULES files stay on
+                     PATH, listed at the end. Safe to rerun. DRY_RUN=1 shows the plan.
+  start              organize, then backup, then free without asking (free --yes, on all
+                     four folders); stops before free if the backup fails
+  install           systemd user timer: backup BOOT_DELAY after boot + every hour
   uninstall          remove that timer
   status             timer state + the end of today's log
 
@@ -1376,15 +1401,260 @@ restore() {
     rc copy "gcrypt:$path" "$dest" --links --stats 1m --stats-one-line -v ${DRY_RUN:+--dry-run}
 }
 
-# organize (only PATH, if given), backup, free in one go, without asking: running start is
-# the go-ahead for free. free always goes through all four folders, since PATH is usually
-# somewhere organize moves files out of (e.g. ~/Downloads), not one of them.
-# organize failures don't stop it (backup does the same with ORGANIZE_ON_BACKUP), but a
-# failed backup does: backup dies before free runs.
+# Sets VAR to REL, or with N > 0 to "REL (N).ext" (as unique_path names them).
+numbered_path() {
+    local p=$2 base=$2 ext=
+    if (($3 > 0)); then
+        [[ ${p##*/} == ?*.* ]] && base=${p%.*} ext=.${p##*.}
+        p="$base ($3)$ext"
+    fi
+    printf -v "$1" %s "$p"
+}
+
+# start PATH: uploads everything in PATH directly to current/<Category>/, then deletes what
+# was verified to be there. Nothing is copied locally: rclone reads the files through a
+# temporary tree of symlinks (STATE_DIR/ingest.*), whose names are the paths wanted on Drive.
+#
+# Each round links every file still to place at its candidate path, uploads with
+# --ignore-existing (so nothing on Drive is ever overwritten) and runs cryptcheck. A match
+# means Drive holds that file's exact contents there: uploaded now, or by an earlier run. A
+# file found to differ from what's at its path goes round again as "name (1)", and so on, so
+# a rerun finds its own earlier uploads rather than making copies. Anything else (upload or
+# network errors) just stays on PATH for the next run.
+#
+# Candidates also avoid a different local file at the same path in the category folder, which
+# the next backup would upload over this one, and every upload goes in directory.json before
+# the original is deleted, so organize won't reuse its name either.
+ingest() {
+    need
+    (($# == 1)) || die "usage: start PATH"
+    local path root cat e var d p rec rel f size mtime i n key cand rs base l src dst out
+    path=$(realpath -e -- "${1/#\~/$HOME}" 2>/dev/null) && [[ -d $path ]] || die "Not a folder: $1"
+    root=$(abspath "$ORGANIZE_ROOT") ORG_ROOT=$root
+    # This deletes what it backs up, so a mistyped PATH mustn't reach the system or all of home.
+    [[ $path != / ]] || die "Refusing to go through /."
+    for d in "$HOME" "$root"; do
+        [[ $path != "$d" && $d != "$path"/* ]] || die "Refusing $path: it holds $d."
+    done
+    case $path in
+        /bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/opt|/opt/*|\
+        /proc|/proc/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*|/var|/var/*)
+            die "Refusing $path: it's a system folder." ;;
+    esac
+    for cat in "${CATEGORIES[@]}"; do
+        [[ $path != "$root/$cat" && $path != "$root/$cat"/* ]] ||
+            die "$path is in $root/$cat, which backup already covers."
+    done
+    [[ ! -e $path/.git ]] || die "$path is a git repo; start never touches those."
+    lock
+    IDX_OLD=() IDX_SIZE=() IDX_MTIME=() IDX_HASH=() BY_HASH=() BACKUP_ONLY=()
+    echo "== $(date '+%F %T') start $path${DRY_RUN:+ (dry run)}"
+
+    # category_of and has_video read ext_cat; the files this script needs stay put.
+    local -A ext_cat=()
+    for cat in "${CATEGORIES[@]}"; do
+        var=${cat^^}_EXTS
+        for e in ${!var//,/ }; do ext_cat[${e,,}]=$cat; done
+    done
+    local protected=()
+    for p in "$SELF" "$ENV_FILE" "$RCLONE_CONFIG" "$KEY"; do protected+=("$(realpath -m -- "$p")"); done
+
+    # The temp trees of a run that was killed outright are only symlinks; rm doesn't follow them.
+    rm -rf -- "$STATE_DIR"/ingest.??????
+    local stage
+    stage=$(mktemp -d "$STATE_DIR/ingest.XXXXXX")
+    CLEAN_TMP=("$stage")
+
+    # What's on PATH (size and time, to notice a file changing), and which of it to back up.
+    local -A all_size=() all_mtime=()
+    while IFS= read -r -d '' rec; do
+        size=${rec%%/*} rec=${rec#*/}
+        mtime=${rec%%/*} mtime=${mtime%.*} rel=${rec#*/}
+        all_size[$rel]=$size all_mtime[$rel]=$mtime
+    done < <(find "$path" -xdev -type f -printf '%s/%T@/%P\0')
+    local filters=()
+    if [[ -n $BACKUP_FILTER ]]; then filters+=(--filter-from "$(abspath "$BACKUP_FILTER")"); fi
+    rc lsf -R --files-only "$path" "${filters[@]}" --filter-from - --ignore-case \
+        --exclude-if-present .nobackup --exclude-if-present CACHEDIR.TAG \
+        --one-file-system --skip-links --skip-specials \
+        <<<"$INGEST_RULES$FILTER_RULES" >"$stage/list" || die "Could not read $path."
+    # Git repos stay whole, or a repo would lose its files and keep only .git. Found here as
+    # rclone's --exclude-if-present errors on a folder, and .git usually is one.
+    local repos=()
+    while IFS= read -r -d '' rel; do repos+=("${rel%/.git}"); done \
+        < <(find "$path" -mindepth 2 -xdev -name .git -printf '%P\0')
+
+    # Category and path below it for each file, plain top-level category folders flattened
+    # (Pictures/a.jpg on PATH goes to current/Pictures/a.jpg, not current/Pictures/Pictures/).
+    local -a s_rel=() s_cat=() s_base=() s_n=() s_cand=() s_new=() pending=() next=() verified=()
+    local -A cats=() r_name=() tracked=()
+    while IFS= read -r rel; do
+        [[ -n ${all_size[$rel]:-} ]] || continue   # e.g. a line break in its name: left alone
+        f=$path/$rel
+        for p in "${protected[@]}"; do [[ $f == "$p" ]] && continue 2; done
+        for p in "${repos[@]+"${repos[@]}"}"; do [[ $rel == "$p"/* ]] && continue 2; done
+        category_of cat "$f"
+        if [[ -z $cat ]]; then
+            e=${rel##*.} e=${e,,} cat=Documents
+            [[ $rel == *.* && " ${SUB_EXTS,,} " == *" $e "* ]] && has_video "$f" && cat=Videos
+        fi
+        base=$rel
+        [[ $rel == */* && ${rel%%/*} == "$cat" ]] && base=${rel#*/}
+        pending+=("${#s_rel[@]}")
+        s_rel+=("$rel") s_cat+=("$cat") s_base+=("$base") s_n+=(0) s_cand+=("") s_new+=("")
+        cats[$cat]=1
+    done <"$stage/list"
+
+    # What's on Drive already.
+    local -A remote=() planned=() ok=() differ=() round=()
+    for cat in "${!cats[@]}"; do
+        if out=$(backup_name "$root/$cat"); then tracked[$cat]=1; else out=$cat; fi
+        r_name[$cat]=$out
+        echo "== $(date '+%F %T') listing current/$out on Drive"
+        i=0; rc lsf -R --files-only --format sp "gcrypt:current/$out" >"$stage/remote" 2>/dev/null || i=$?
+        ((i == 0 || i == 3)) || die "Can't read current/$out on Drive; nothing was changed."
+        while IFS= read -r l; do
+            [[ -n $l ]] && remote[$cat/${l#*;}]=${l%%;*}
+        done <"$stage/remote"
+    done
+
+    local uploaded=0 already=0 failed=0
+    while ((${#pending[@]})); do
+        rm -rf -- "$stage/tree"
+        round=() next=() ok=() differ=()
+        for i in "${pending[@]}"; do
+            rel=${s_rel[i]} cat=${s_cat[i]} base=${s_base[i]} n=${s_n[i]}
+            f=$path/$rel size=${all_size[$rel]}
+            while :; do
+                numbered_path cand "$base" "$n"
+                key=$cat/$cand l=$root/$cat/$cand
+                if [[ -z ${planned[$key]:-} && $cand != "$INDEX_NAME" ]] &&
+                    { [[ ! -e $l ]] || cmp -s -- "$l" "$f"; }; then
+                    rs=${remote[$key]:-}
+                    [[ -n $rs && $rs != "$size" ]] || break
+                fi
+                n=$((n + 1))
+            done
+            planned[$key]=1 s_n[i]=$n s_cand[i]=$cand s_new[i]=1
+            [[ -n ${remote[$key]:-} ]] && s_new[i]=
+            mkdir -p -- "$(dirname -- "$stage/tree/$key")"
+            ln -sT -- "$f" "$stage/tree/$key"
+            round[$cat]=1
+        done
+        for cat in "${!round[@]}"; do
+            src=$stage/tree/$cat dst=gcrypt:current/${r_name[$cat]}
+            if [[ -z ${DRY_RUN:-} ]]; then
+                echo "== $(date '+%F %T') uploading $cat to current/${r_name[$cat]}"
+                rc copy --copy-links "$src" "$dst" --ignore-existing --drive-stop-on-upload-limit \
+                    --stats 1m --stats-one-line -v ||
+                    echo "  [WARN] some uploads of $cat failed; those files stay on PATH" >&2
+            fi
+            echo "== $(date '+%F %T') verifying $cat"
+            : >"$stage/match" ; : >"$stage/differ"
+            # Its exit code says nothing here (a file not uploaded fails it); the lists do.
+            rc cryptcheck --copy-links "$src" "$dst" --one-way \
+                --match "$stage/match" --differ "$stage/differ" >/dev/null 2>&1 || true
+            while IFS= read -r l; do [[ -n $l ]] && ok[$cat/$l]=1; done <"$stage/match"
+            while IFS= read -r l; do [[ -n $l ]] && differ[$cat/$l]=1; done <"$stage/differ"
+        done
+        for i in "${pending[@]}"; do
+            key=${s_cat[i]}/${s_cand[i]} rel=${s_rel[i]}
+            if [[ -n ${ok[$key]:-} ]]; then
+                verified+=("$i")
+                if [[ -n ${s_new[i]} ]]; then
+                    uploaded=$((uploaded + 1))
+                    echo "  $rel -> current/${r_name[${s_cat[i]}]}/${s_cand[i]}"
+                else
+                    already=$((already + 1))
+                    echo "  $rel: already in the backup as current/${r_name[${s_cat[i]}]}/${s_cand[i]}"
+                fi
+            elif [[ -n ${differ[$key]:-} && -z ${s_new[i]} ]]; then
+                s_n[i]=$((s_n[i] + 1)) next+=("$i")   # another file has that name: try the next
+            elif [[ -n ${DRY_RUN:-} && -n ${s_new[i]} ]]; then
+                echo "  $rel -> current/${r_name[${s_cat[i]}]}/${s_cand[i]} (would upload, then delete)"
+            else
+                echo "  [FAIL] not verified, staying on PATH: $rel" >&2; failed=$((failed + 1))
+            fi
+        done
+        ((${#next[@]} == 0)) && pending=() || pending=("${next[@]}")
+    done
+    rm -rf -- "$stage"; CLEAN_TMP=()
+
+    if [[ -n ${DRY_RUN:-} ]]; then
+        echo "== start (dry run): ${#s_rel[@]} file(s); $already already in the backup would be deleted from PATH; nothing was changed"
+        ((failed == 0)); return
+    fi
+
+    # Into directory.json before anything is deleted, so a stop can't leave an upload unlisted.
+    # Fresh computer: start from the backup's directory.json, not an empty one that would then
+    # replace it. A file that can't be read for its checksum isn't deleted.
+    local h deleted=0 freed=0
+    local -A hashed=() emptied=()
+    for cat in "${!tracked[@]}"; do
+        d=$root/$cat
+        mkdir -p -- "$d"
+        [[ -e $d/$INDEX_NAME ]] ||
+            rc copyto "gcrypt:current/${r_name[$cat]}/$INDEX_NAME" "$d/$INDEX_NAME" >/dev/null 2>&1 || true
+        idx_load "$d"; idx_scan "$d"; idx_keep_backup_only "$d"
+    done
+    for i in "${verified[@]+"${verified[@]}"}"; do
+        rel=${s_rel[i]} cat=${s_cat[i]} p=$root/$cat/${s_cand[i]}
+        if [[ -z ${tracked[$cat]:-} ]]; then hashed[$i]=1; continue; fi
+        if ! h=$(file_hash "$path/$rel"); then
+            echo "  [FAIL] could not read $rel; it stays on PATH" >&2; failed=$((failed + 1)); continue
+        fi
+        hashed[$i]=1
+        [[ -e $p ]] && continue   # the same file is here too: idx_scan has it
+        idx_add "$p" "${all_size[$rel]}" "${all_mtime[$rel]}" "$h"
+        BACKUP_ONLY[$p]=1
+    done
+    for cat in "${!tracked[@]}"; do
+        d=$root/$cat
+        idx_write "$d"
+        [[ -f $d/$INDEX_NAME ]] && { rc copyto "$d/$INDEX_NAME" "gcrypt:current/${r_name[$cat]}/$INDEX_NAME" \
+            --backup-dir "gcrypt:archive/$(date +%F_%H%M%S)/${r_name[$cat]}" >/dev/null 2>&1 ||
+            echo "  [WARN] could not upload $cat's $INDEX_NAME; the next backup will" >&2; }
+    done
+
+    for i in "${verified[@]+"${verified[@]}"}"; do
+        [[ -n ${hashed[$i]:-} ]] || continue
+        rel=${s_rel[i]} f=$path/$rel
+        out=$(stat -c '%s %Y' -- "$f" 2>/dev/null) || continue
+        if [[ $out != "${all_size[$rel]} ${all_mtime[$rel]}" ]]; then
+            echo "  [SKIP] $rel changed meanwhile; it stays on PATH"; continue
+        fi
+        if rm -f -- "$f" && [[ ! -e $f ]]; then
+            deleted=$((deleted + 1)) freed=$((freed + ${all_size[$rel]}))
+            d=${f%/*}
+            while [[ $d == "$path"/* ]]; do emptied[$d]=1 d=${d%/*}; done
+        else
+            echo "  [FAIL] could not delete $f (read-only drive?)" >&2; failed=$((failed + 1))
+        fi
+    done
+    while IFS= read -r -d '' d; do
+        [[ -d $d && ! -L $d && -z $(find "$d" -mindepth 1 -print -quit) ]] || continue
+        rmdir -- "$d" || echo "  [WARN] could not remove empty folder $d" >&2
+    done < <(((${#emptied[@]})) && printf '%s\0' "${!emptied[@]}" | sort -rz)
+
+    # What's still on PATH, for a look: excluded by a rule, symlinks, failures.
+    local left=0
+    while IFS= read -r -d '' rel; do
+        left=$((left + 1))
+        ((left <= 50)) && echo "  left on PATH: $rel"
+    done < <(find "$path" -xdev ! -type d -printf '%P\0' | sort -z)
+    ((left <= 50)) || echo "  ... and $((left - 50)) more"
+    echo "== start: uploaded $uploaded, already in backup $already, deleted $deleted from PATH ($(numfmt --to=iec "$freed")B), failed $failed, left on PATH $left"
+    ((failed == 0)) || die "Some files weren't backed up or deleted; run the same command again."
+}
+
+# With PATH: see ingest. Without: organize, backup, free in one go, without asking: running
+# start is the go-ahead for free. organize failures don't stop it (backup does the same with
+# ORGANIZE_ON_BACKUP), but a failed backup does: backup dies before free runs.
 start() {
     (($# <= 1)) || die "usage: start [PATH]"
+    if (($#)); then ingest "$1"; return; fi
     local failed=0
-    organize "$@" || failed=1
+    organize || failed=1
     ORGANIZE_ON_BACKUP=0 backup
     free --yes
     ((failed == 0)) || die "organize had failures; see above."
